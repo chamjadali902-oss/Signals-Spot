@@ -1,139 +1,182 @@
 import requests
 import pandas as pd
-import time
 from datetime import datetime
+import traceback
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 
 TELEGRAM_BOT_TOKEN = "8408138871:AAEAFLXN-0_NX4f94DRTCfXAIY7IK5GDYmY"
 TELEGRAM_CHAT_ID = "8565460915"
 
 BASE_URL = "https://api.binance.com"
 TIMEFRAME = "5m"
-LIMIT = 100
+LIMIT = 120
+TOP_LIMIT = 100
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "MATICUSDT"
-]
-
-# ================== TELEGRAM ==================
+# ================= TELEGRAM =================
 
 def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-    requests.post(url, data=data)
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except:
+        pass
 
-# ================== BINANCE ==================
+# ================= BINANCE =================
 
-def get_klines(symbol, interval, limit):
-    url = f"{BASE_URL}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    if r.status_code != 200:
+def safe_float(x):
+    try:
+        return float(x)
+    except:
         return None
 
-    df = pd.DataFrame(r.json(), columns=[
-        "time","open","high","low","close","volume",
-        "c1","c2","c3","c4","c5","c6"
-    ])
+def get_klines(symbol, interval, limit):
+    try:
+        r = requests.get(
+            f"{BASE_URL}/api/v3/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=10
+        )
+        if r.status_code != 200:
+            return None
 
-    df = df[["time","open","high","low","close","volume"]]
-    df["close"] = df["close"].astype(float)
-    df["volume"] = df["volume"].astype(float)
-    return df
+        df = pd.DataFrame(r.json(), columns=[
+            "t","o","h","l","c","v","_","_","_","_","_","_"
+        ])
+        df = df[["o","h","l","c","v"]].astype(float)
+        df.columns = ["open","high","low","close","volume"]
+        return df
+    except:
+        return None
 
-# ================== INDICATORS ==================
+def get_24h_tickers():
+    try:
+        r = requests.get(f"{BASE_URL}/api/v3/ticker/24hr", timeout=10)
+        if r.status_code != 200:
+            return []
+        return r.json()
+    except:
+        return []
 
-def EMA(series, period):
-    return series.ewm(span=period, adjust=False).mean()
+# ================= INDICATORS =================
 
-def RSI(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss
+def EMA(s, p):
+    return s.ewm(span=p, adjust=False).mean()
+
+def RSI(s, p=14):
+    d = s.diff()
+    g = d.clip(lower=0)
+    l = -d.clip(upper=0)
+    ag = g.rolling(p).mean()
+    al = l.rolling(p).mean()
+    rs = ag / al
     return 100 - (100 / (1 + rs))
 
-# ================== BTC FILTER (LOOSE) ==================
+# ================= BTC SAFETY =================
 
-def btc_market_ok():
+def btc_safe():
     df = get_klines("BTCUSDT", "15m", 100)
     if df is None or len(df) < 50:
         return False
-
-    ema50 = EMA(df["close"], 50).iloc[-1]
+    ema100 = EMA(df["close"], 100).iloc[-1]
     price = df["close"].iloc[-1]
+    return price >= ema100 * 0.99
 
-    return price >= ema50 * 0.995  # loose institutional filter
+# ================= STRATEGIES =================
 
-# ================== SCORE LOGIC ==================
-
-def calculate_score(df):
-    score = 0
-    reasons = []
-
+def trend_score(df):
+    score, reasons = 0, []
     ema9 = EMA(df["close"], 9)
     ema21 = EMA(df["close"], 21)
     ema50 = EMA(df["close"], 50)
-
     rsi = RSI(df["close"])
     vol_avg = df["volume"].rolling(20).mean()
 
     if ema9.iloc[-1] > ema21.iloc[-1]:
-        score += 1
-        reasons.append("EMA9 > EMA21")
-
+        score += 1; reasons.append("EMA9>EMA21")
     if ema21.iloc[-1] > ema50.iloc[-1]:
-        score += 1
-        reasons.append("EMA21 > EMA50")
-
+        score += 1; reasons.append("EMA21>EMA50")
     if 45 <= rsi.iloc[-1] <= 70:
-        score += 1
-        reasons.append("RSI healthy")
-
+        score += 1; reasons.append("RSI healthy")
     if df["volume"].iloc[-1] > vol_avg.iloc[-1]:
-        score += 1
-        reasons.append("Volume spike")
-
-    if btc_market_ok():
-        score += 1
-        reasons.append("BTC trend OK")
+        score += 1; reasons.append("Volume spike")
+    if btc_safe():
+        score += 1; reasons.append("BTC safe")
 
     return score, reasons
 
-# ================== MAIN SCAN ==================
+def reversal_score(df):
+    score, reasons = 0, []
+    ema9 = EMA(df["close"], 9)
+    ema21 = EMA(df["close"], 21)
+    rsi = RSI(df["close"])
+    vol_avg = df["volume"].rolling(20).mean()
+
+    if rsi.iloc[-2] < 35 and rsi.iloc[-1] > rsi.iloc[-2]:
+        score += 1; reasons.append("RSI bounce")
+    if ema9.iloc[-1] > ema21.iloc[-1] and ema9.iloc[-2] <= ema21.iloc[-2]:
+        score += 1; reasons.append("EMA cross")
+    if df["volume"].iloc[-1] > vol_avg.iloc[-1]:
+        score += 1; reasons.append("Volume spike")
+    if df["close"].iloc[-1] > df["close"].iloc[-2]:
+        score += 1; reasons.append("Green candle")
+
+    return score, reasons
+
+# ================= MAIN =================
 
 def run_once():
-    send_telegram("🔁 Scan Started – Checking Market")
+    send_telegram("🔁 Dual Strategy Scan Running")
 
-    if not btc_market_ok():
-        send_telegram("⚠️ BTC weak/neutral – signals limited")
+    tickers = get_24h_tickers()
 
-    for symbol in SYMBOLS:
-        df = get_klines(symbol, TIMEFRAME, LIMIT)
-        if df is None or len(df) < 50:
+    # -------- TOP 100 VOLUME (CONTINUATION) --------
+    volume_coins = sorted(
+        [c for c in tickers if c.get("symbol","").endswith("USDT") and safe_float(c.get("quoteVolume"))],
+        key=lambda x: safe_float(x["quoteVolume"]),
+        reverse=True
+    )[:TOP_LIMIT]
+
+    for c in volume_coins:
+        try:
+            df = get_klines(c["symbol"], TIMEFRAME, LIMIT)
+            if df is None:
+                continue
+            score, reasons = trend_score(df)
+            if score >= 3:
+                send_telegram(
+                    f"📈 CONTINUATION\n{c['symbol']}\nScore: {score}/5\n" +
+                    " | ".join(reasons)
+                )
+        except:
             continue
 
-        score, reasons = calculate_score(df)
+    # -------- TOP 100 LOSERS (REVERSAL) --------
+    losers = sorted(
+        [c for c in tickers if c.get("symbol","").endswith("USDT") and safe_float(c.get("priceChangePercent"))],
+        key=lambda x: safe_float(x["priceChangePercent"])
+    )[:TOP_LIMIT]
 
-        if score >= 3:
-            price = df["close"].iloc[-1]
-            msg = (
-                f"🚀 SPOT SIGNAL\n\n"
-                f"🪙 Coin: {symbol}\n"
-                f"⏱ TF: {TIMEFRAME}\n"
-                f"💰 Price: {price}\n"
-                f"⭐ Score: {score}/5\n\n"
-                f"🧠 Reasons:\n- " + "\n- ".join(reasons) +
-                f"\n\n⏰ {datetime.utcnow()} UTC"
-            )
-            send_telegram(msg)
+    for c in losers:
+        try:
+            df = get_klines(c["symbol"], TIMEFRAME, LIMIT)
+            if df is None:
+                continue
+            score, reasons = reversal_score(df)
+            if score >= 3:
+                send_telegram(
+                    f"🔄 REVERSAL\n{c['symbol']}\n24h: {c['priceChangePercent']}%\n" +
+                    " | ".join(reasons)
+                )
+        except:
+            continue
 
-# ================== ENTRY ==================
+# ================= ENTRY =================
 
 if __name__ == "__main__":
-    send_telegram("🚀 Crypto Spot Institutional Engine STARTED")
-    run_once()
+    try:
+        send_telegram("🚀 Engine1 Started Successfully")
+        run_once()
+    except Exception as e:
+        send_telegram("❌ BOT CRASHED:\n" + str(e))
+        send_telegram(traceback.format_exc())
