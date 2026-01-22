@@ -126,7 +126,7 @@ def reversal_score(df):
 # ================= MAIN =================
 
 def run_once():
-    send_telegram("🔁 Dual Strategy Scan Running")
+    send_telegram("🔁 Dual Strategy1 Scan Running")
 
     tickers = get_24h_tickers()
 
